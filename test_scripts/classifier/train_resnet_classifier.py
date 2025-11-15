@@ -7,7 +7,7 @@ from pathlib import Path
 
 def main():
     # Create output directory
-    Path('models/resnet_classifier').mkdir(parents=True, exist_ok=True)
+    Path('../../models/resnet_classifier').mkdir(parents=True, exist_ok=True)
 
     # Initialize classifier
     print("Initializing ResNet-18 classifier...")

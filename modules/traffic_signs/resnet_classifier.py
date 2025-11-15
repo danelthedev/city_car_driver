@@ -260,7 +260,7 @@ class ResnetClassifier(TrafficSignClassifier):
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=0.01)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5,
-                                                          patience=3, verbose=True)
+                                                          patience=3)
 
         # Training history
         history = {

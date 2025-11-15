@@ -14,7 +14,11 @@ def main():
     print("YOLO Traffic Sign Detector - Training Pipeline")
     print("=" * 60)
 
-    detector = YoloTrafficSignDetector(confidence_threshold=0.5)
+    # During training, disable half precision to avoid dtype conflicts
+    detector = YoloTrafficSignDetector(
+        confidence_threshold=0.5,
+        use_half=False  # Disable half precision during training
+    )
 
     # Path to the GTSDB_YOLO dataset YAML file
     data_yaml = "data/datasets/GTSDB_YOLO/data.yaml"
@@ -68,7 +72,7 @@ def main():
         print(f"\nBest model saved at: {best_model_path}")
 
         # Copy best model to a permanent location
-        final_model_path = Path("../models") / "yolo" / "gtsdb_best.pt"
+        final_model_path = Path("models") / "yolo_detector" / "best_model.pt"
         final_model_path.parent.mkdir(parents=True, exist_ok=True)
 
         # Load best model and save it

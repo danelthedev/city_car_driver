@@ -25,9 +25,8 @@ class YoloTrafficSignDetector(TrafficSignDetector):
         if model_path and Path(model_path).exists():
             self.load_model(model_path)
         else:
-            # Initialize with YOLOv8 nano model for traffic sign detection
-            self.model = YOLO('yolov8n.pt')
-            print("Initialized with YOLOv8n base model")
+            self.model = YOLO('yolo11m.pt')
+            print("Initialized with YOLO11m base model")
 
     def load_model(self, model_path: str = None) -> None:
         """
@@ -73,7 +72,7 @@ class YoloTrafficSignDetector(TrafficSignDetector):
             Dictionary containing training history and metrics
         """
         if self.model is None:
-            self.model = YOLO('yolov8n.pt')
+            self.model = YOLO('yolo11m.pt')
 
         # Default training parameters
         train_params = {
@@ -173,10 +172,15 @@ class YoloTrafficSignDetector(TrafficSignDetector):
         if self.model is None:
             raise ValueError("No model loaded. Load or train a model first.")
 
+        # Create tmp folder if it doesn't exist
+        tmp_dir = Path("tmp")
+        tmp_dir.mkdir(exist_ok=True)
+
         # Run inference
         results = self.model(image, conf=self.confidence_threshold, device=self.device, verbose=False)
 
         detections = []
+        sign_counter = 0
 
         # Process results
         for result in results:
@@ -204,6 +208,22 @@ class YoloTrafficSignDetector(TrafficSignDetector):
                 }
 
                 detections.append(detection)
+
+                # Crop and save the traffic sign
+                x1, y1, x2, y2 = [int(coord) for coord in detection['bbox']]
+                # Ensure coordinates are within image bounds
+                x1 = max(0, x1)
+                y1 = max(0, y1)
+                x2 = min(image.shape[1], x2)
+                y2 = min(image.shape[0], y2)
+
+                cropped_sign = image[y1:y2, x1:x2]
+
+                # Save cropped sign with unique filename
+                filename = f"sign_{sign_counter}.png"
+                save_path = tmp_dir / filename
+                cv2.imwrite(str(save_path), cropped_sign)
+                sign_counter += 1
 
         return detections
 

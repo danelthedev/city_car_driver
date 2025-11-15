@@ -1,7 +1,10 @@
 # YOLO and Deep Learning
 ultralytics>=8.3.0
-torch>=2.0.0
-torchvision>=0.15.0
+# PyTorch with CUDA support - Install manually:
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+# For CPU-only: pip install torch torchvision
+# torch>=2.0.0
+# torchvision>=0.15.0
 
 # Image Processing
 opencv-python>=4.8.0

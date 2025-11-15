@@ -247,3 +247,6 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# Ignore data folder and all its contents
+data/
+data/*

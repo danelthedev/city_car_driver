@@ -13,11 +13,11 @@ import torch
 def train_detector(
     data_yaml: str = "data/datasets/GTSDB_YOLO_1_CLASS/data.yaml",
     model_size: str = 'n',
-    epochs: int = 100,
+    epochs: int = 150,
     batch_size: int = 16,
-    imgsz: int = 1280,
+    imgsz: int = 640,
     project: str = "models",
-    name: str = "yolo_detector2",
+    name: str = "yolo_detector",
     device: str = 'cuda',
     resume: bool = False,
     pretrained: bool = True
@@ -187,7 +187,7 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=100,
+        default=150,
         help="Number of training epochs"
     )
 

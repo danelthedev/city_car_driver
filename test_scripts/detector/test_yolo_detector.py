@@ -170,7 +170,7 @@ def main():
     parser.add_argument(
         "--confidence",
         type=float,
-        default=0.25,
+        default=0.1,
         help="Confidence threshold for detections (default: 0.25 for better recall)"
     )
 

@@ -7,34 +7,12 @@ from modules.traffic_signs.yolo_detector import YoloTrafficSignDetector
 from pathlib import Path
 import cv2
 import argparse
+from datetime import datetime
+import time
 
 def detect_from_image(model_path: str, image_path: str, output_path: str = None,
                      confidence_threshold: float = 0.25, show: bool = False,
-                     img_size: int = 416, use_half: bool = True, save_crops: bool = False,
-                     multi_scale: bool = False, scales: str = '1.0', tta: bool = False,
-                     adaptive_conf: bool = False, min_conf_small: float = 0.10, small_area_ratio: float = 0.002,
-                     agnostic_nms: bool = False, max_det: int = 300):
-    """
-    Detect traffic signs in a single image.
-
-    Args:
-        model_path: Path to the trained YOLO model
-        image_path: Path to the input image
-        output_path: Path to save the annotated image (optional)
-        confidence_threshold: Minimum confidence for detections (default: 0.25 for better recall)
-        show: Whether to display the result
-        img_size: Base image size for inference (default: 640)
-        use_half: Use FP16 if on GPU (default: True)
-        save_crops: Save cropped detections to tmp/ (default: False)
-        multi_scale: Enable multi-scale inference (default: False)
-        scales: Comma-separated scales for multi-scale (default: 1.0,1.25)
-        tta: Enable test-time augmentation (default: False)
-        adaptive_conf: Enable adaptive confidence for small objects (default: False)
-        min_conf_small: Minimum confidence for small objects (default: 0.10)
-        small_area_ratio: Area ratio threshold for small objects (default: 0.002)
-        agnostic_nms: Use class-agnostic NMS (default: False)
-        max_det: Max detections per image (default: 300)
-    """
+                     save_cutouts: bool = True, cutouts_dir: str = "tmp"):
     print("=" * 60)
     print("YOLO Traffic Sign Detector - Detection")
     print("=" * 60)
@@ -52,22 +30,9 @@ def detect_from_image(model_path: str, image_path: str, output_path: str = None,
 
     # Load the detector with trained model and optimized settings
     print(f"\nLoading model from: {model_path}")
-    # Parse scales string into tuple
-    scale_vals = tuple(float(s) for s in scales.split(',') if s.strip())
     detector = YoloTrafficSignDetector(
         model_path=model_path,
-        confidence_threshold=confidence_threshold,
-        img_size=img_size,
-        use_half=use_half,
-        save_crops=save_crops,
-        multi_scale=multi_scale,
-        scales=scale_vals,
-        tta=tta,
-        adaptive_conf=adaptive_conf,
-        min_conf_small=min_conf_small,
-        small_area_ratio=small_area_ratio,
-        agnostic_nms=agnostic_nms,
-        max_det=max_det
+        confidence_threshold=confidence_threshold
     )
 
     # Load the image
@@ -82,21 +47,70 @@ def detect_from_image(model_path: str, image_path: str, output_path: str = None,
 
     # Detect traffic signs
     print("\nDetecting traffic signs...")
+    start_time = time.time()
     detections = detector.detect(image)
+    inference_time = time.time() - start_time
 
     print(f"\nFound {len(detections)} traffic sign(s):")
+    print(f"Inference time: {inference_time:.3f} seconds ({inference_time*1000:.1f} ms)")
     print("-" * 60)
 
     for i, det in enumerate(detections, 1):
         bbox = det['bbox']
         confidence = det['confidence']
-        class_name = det['class_name']
-        class_id = det['class_id']
 
         print(f"\nDetection {i}:")
-        print(f"  Class: {class_name} (ID: {class_id})")
         print(f"  Confidence: {confidence:.2%}")
         print(f"  Bounding Box: [{bbox[0]:.1f}, {bbox[1]:.1f}, {bbox[2]:.1f}, {bbox[3]:.1f}]")
+
+    # Save cutouts of detected signs
+    if len(detections) > 0 and save_cutouts:
+        print("\n" + "-" * 60)
+        print("Saving traffic sign cutouts...")
+
+        # Create cutouts directory
+        cutouts_path = Path(cutouts_dir)
+        cutouts_path.mkdir(parents=True, exist_ok=True)
+
+        # Generate timestamp for unique filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        image_name = Path(image_path).stem
+
+        saved_cutouts = []
+        for i, det in enumerate(detections, 1):
+            bbox = det['bbox']
+            confidence = det['confidence']
+
+            # Extract bounding box coordinates
+            x1, y1, x2, y2 = map(int, bbox)
+
+            # Add padding to cutout (10% of width/height)
+            h, w = image.shape[:2]
+            bbox_w = x2 - x1
+            bbox_h = y2 - y1
+            padding_x = int(bbox_w * 0.1)
+            padding_y = int(bbox_h * 0.1)
+
+            # Apply padding with boundary checks
+            x1_padded = max(0, x1 - padding_x)
+            y1_padded = max(0, y1 - padding_y)
+            x2_padded = min(w, x2 + padding_x)
+            y2_padded = min(h, y2 + padding_y)
+
+            # Extract cutout
+            cutout = image[y1_padded:y2_padded, x1_padded:x2_padded]
+
+            # Generate filename
+            cutout_filename = f"{image_name}_{timestamp}_sign{i:02d}_conf{confidence:.2f}.jpg"
+            cutout_path = cutouts_path / cutout_filename
+
+            # Save cutout
+            cv2.imwrite(str(cutout_path), cutout)
+            saved_cutouts.append(str(cutout_path))
+            print(f"  Saved cutout {i}: {cutout_path}")
+
+        print(f"\nTotal {len(saved_cutouts)} cutout(s) saved to: {cutouts_path}")
+
 
     # Visualize detections
     if len(detections) > 0:
@@ -112,6 +126,15 @@ def detect_from_image(model_path: str, image_path: str, output_path: str = None,
 
     else:
         print("\nNo traffic signs detected in the image.")
+
+    # Display performance metrics
+    fps = 1.0 / inference_time if inference_time > 0 else 0
+    print("\n" + "-" * 60)
+    print("Performance Metrics:")
+    print(f"  Inference Time: {inference_time:.3f} seconds")
+    print(f"  Milliseconds: {inference_time*1000:.1f} ms")
+    print(f"  FPS: {fps:.2f}")
+    print("-" * 60)
 
     print("\n" + "=" * 60)
     print("Detection Completed!")
@@ -158,68 +181,23 @@ def main():
     )
 
     parser.add_argument(
-        "--img-size",
-        type=int,
-        default=640,
-        help="Base image size for inference (default: 640)"
-    )
-
-    parser.add_argument(
-        "--multi-scale",
+        "--save-cutouts",
         action="store_true",
-        help="Enable multi-scale inference"
+        default=True,
+        help="Save cutouts of detected traffic signs (default: True)"
     )
 
     parser.add_argument(
-        "--scales",
+        "--no-cutouts",
+        action="store_true",
+        help="Disable saving cutouts of detected traffic signs"
+    )
+
+    parser.add_argument(
+        "--cutouts-dir",
         type=str,
-        default="1.0,1.25",
-        help="Comma-separated scales for multi-scale (default: 1.0,1.25)"
-    )
-
-    parser.add_argument(
-        "--tta",
-        action="store_true",
-        help="Enable test-time augmentation"
-    )
-
-    parser.add_argument(
-        "--adaptive-conf",
-        action="store_true",
-        help="Enable adaptive confidence for small objects"
-    )
-
-    parser.add_argument(
-        "--min-conf-small",
-        type=float,
-        default=0.10,
-        help="Minimum confidence for small objects"
-    )
-
-    parser.add_argument(
-        "--small-area-ratio",
-        type=float,
-        default=0.002,
-        help="Area ratio threshold for small objects"
-    )
-
-    parser.add_argument(
-        "--agnostic-nms",
-        action="store_true",
-        help="Use class-agnostic NMS"
-    )
-
-    parser.add_argument(
-        "--max-det",
-        type=int,
-        default=300,
-        help="Max detections per image"
-    )
-
-    parser.add_argument(
-        "--save-crops",
-        action="store_true",
-        help="Save cropped detections to tmp/"
+        default="tmp",
+        help="Directory to save traffic sign cutouts (default: tmp)"
     )
 
     args = parser.parse_args()
@@ -235,17 +213,8 @@ def main():
         output_path=args.output,
         confidence_threshold=args.confidence,
         show=args.show,
-        img_size=args.img_size,
-        use_half=True,
-        save_crops=args.save_crops,
-        multi_scale=args.multi_scale,
-        scales=args.scales,
-        tta=args.tta,
-        adaptive_conf=args.adaptive_conf,
-        min_conf_small=args.min_conf_small,
-        small_area_ratio=args.small_area_ratio,
-        agnostic_nms=args.agnostic_nms,
-        max_det=args.max_det
+        save_cutouts=not args.no_cutouts,
+        cutouts_dir=args.cutouts_dir
     )
 
 if __name__ == "__main__":

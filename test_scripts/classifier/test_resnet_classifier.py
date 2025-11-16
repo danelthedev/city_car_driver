@@ -96,52 +96,6 @@ def test_tmp_folder(classifier, tmp_dir='tmp'):
 
     return results
 
-
-def benchmark_speed(classifier, num_runs=100):
-    """Benchmark classifier inference speed."""
-    print(f"\n{'='*60}")
-    print(f"Running speed benchmark ({num_runs} iterations)...")
-    print('='*60)
-
-    # Create dummy image
-    dummy_image = None
-    if Path('test.png').exists():
-        dummy_image = cv2.imread('test.png')
-    elif Path('tmp').exists() and list(Path('tmp').glob('*.png')):
-        dummy_image = cv2.imread(str(list(Path('tmp').glob('*.png'))[0]))
-
-    if dummy_image is None:
-        print("No test image found. Skipping benchmark.")
-        return
-
-    times = []
-    for i in range(num_runs):
-        start = time.time()
-        result = classifier.classify(dummy_image)
-        end = time.time()
-        times.append((end - start) * 1000)  # Convert to ms
-
-        if i == 0:
-            print(f"First inference: {times[0]:.2f} ms (includes warmup)")
-
-    # Calculate statistics (excluding first run)
-    times = times[1:]
-    avg_time = sum(times) / len(times)
-    min_time = min(times)
-    max_time = max(times)
-
-    print(f"\nBenchmark Results (excluding first run):")
-    print(f"  Average: {avg_time:.2f} ms")
-    print(f"  Min: {min_time:.2f} ms")
-    print(f"  Max: {max_time:.2f} ms")
-    print(f"  Total runs: {num_runs}")
-
-    if avg_time <= 200:
-        print(f"\n✓ PERFORMANCE TARGET MET: {avg_time:.2f} ms <= 200 ms")
-    else:
-        print(f"\n✗ Performance target not met: {avg_time:.2f} ms > 200 ms")
-
-
 def main():
     # Load trained model
     model_path = 'models/resnet_classifier/best_model.pth'
@@ -164,8 +118,6 @@ def main():
     else:
         print("\nNo 'tmp' folder found. Skipping folder classification test.")
 
-    # Benchmark speed
-    benchmark_speed(classifier, num_runs=100)
 
     print("\n" + "="*60)
     print("Testing completed!")

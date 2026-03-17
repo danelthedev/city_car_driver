@@ -1,7 +1,9 @@
+from typing import Optional
+
 from .base import BaseTrafficSignDetector
 
 class SSDDetector(BaseTrafficSignDetector):
-    def __init__(self, model_path: str = None, device: str = "cuda"):
+    def __init__(self, model_path: Optional[str] = None, device: str = "cuda"):
         super().__init__(model_path=model_path, device=device)
         self.load_model()
         
@@ -17,6 +19,6 @@ class SSDDetector(BaseTrafficSignDetector):
         print(f"Evaluating SSD on {data_path}...")
         return {"mAP": 0.0}
 
-    def predict(self, image, confidence_threshold=0.5):
+    def predict(self, image, confidence_threshold=0.5, **kwargs):
         # Stub for detection
         return []

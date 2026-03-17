@@ -18,6 +18,6 @@ class FasterRCNNDetector(BaseTrafficSignDetector):
         print(f"Evaluating Faster R-CNN on {data_path}...")
         return {"mAP": 0.0}
 
-    def predict(self, image, confidence_threshold=0.5):
+    def predict(self, image, confidence_threshold=0.5, **kwargs):
         # Stub for detection
         return []

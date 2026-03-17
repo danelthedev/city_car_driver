@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 
@@ -9,7 +9,7 @@ class BaseTrafficSignDetector(ABC):
     Enforces a standard API for loading models, training, evaluation, and prediction.
     """
 
-    def __init__(self, model_path: str = None, device: str = "cuda"):
+    def __init__(self, model_path: Optional[str] = None, device: str = "cuda"):
         """
         Initialize the detector.
 
@@ -55,13 +55,19 @@ class BaseTrafficSignDetector(ABC):
         pass
 
     @abstractmethod
-    def predict(self, image: np.ndarray, confidence_threshold: float = 0.5) -> List[Tuple[int, int, int, int, float, int]]:
+    def predict(
+        self,
+        image: np.ndarray,
+        confidence_threshold: float = 0.5,
+        **kwargs,
+    ) -> List[Tuple[int, int, int, int, float, int]]:
         """
         Detect traffic signs in an image.
 
         Args:
             image (np.ndarray): The input image in BGR format (OpenCV default).
             confidence_threshold (float, optional): Minimum confidence to return a bounding box.
+            **kwargs: Optional backend-specific inference settings (e.g. image size).
 
         Returns:
             List[Tuple[int, int, int, int, float, int]]: A list of detections where each detection is

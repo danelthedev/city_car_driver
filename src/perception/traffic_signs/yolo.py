@@ -20,6 +20,19 @@ class YOLODetector(BaseTrafficSignDetector):
         self.model.to(self.device)
 
     def train(self, data_path: str, epochs: int = 100, batch_size: int = 16, **kwargs):
+        speed_kwargs = {
+            # "cache": True,     # RAM caching
+            # "workers": 8,      # Maximize CPU dataloading
+            # "plots": False,    # Stop drawing validation pictures
+            # "half": True       # Force FP16 matrix speedups
+        }
+
+        # Merge the speedups with any existing kwargs
+        for k, v in speed_kwargs.items():
+            if k not in kwargs:
+                print(f"Applying training speedup: {k}={v}")
+                kwargs[k] = v
+        
         # YOLOv8 expects a .yaml file configuring the dataset
         results = self.model.train(
             data=data_path,
@@ -37,8 +50,24 @@ class YOLODetector(BaseTrafficSignDetector):
             "mAP50-95": results.box.map
         }
 
-    def predict(self, image: np.ndarray, confidence_threshold: float = 0.5) -> List[Tuple[int, int, int, int, float, int]]:
-        results = self.model(image, conf=confidence_threshold, device=self.device, verbose=False)
+    def predict(
+        self,
+        image: np.ndarray,
+        confidence_threshold: float = 0.5,
+        image_size: int = 1280,
+        **kwargs,
+    ) -> List[Tuple[int, int, int, int, float, int]]:
+        if image_size < 320:
+            image_size = 320
+
+        results = self.model(
+            image,
+            conf=confidence_threshold,
+            imgsz=image_size,
+            device=self.device,
+            verbose=False,
+            **kwargs,
+        )
         
         detections = []
         for box in results[0].boxes:

@@ -46,3 +46,6 @@ if __name__ == "__main__":
     gtsdb_url = "https://sid.erda.dk/public/archives/ff17dc924eba88d5d01a807357d6614c/FullIJCNN2013.zip"
     download_and_extract(gtsdb_url, os.path.join(data_dir, "gtsdb"))
     
+    # 2. GTSRB (German Traffic Sign Recognition Benchmark - Kaggle)
+    download_kaggle_dataset("meowmeowmeowmeowmeow/gtsrb-german-traffic-sign", os.path.join(data_dir, "gtsrb"))
+    

@@ -1,5 +1,3 @@
-
-
 import argparse
 import os
 import shutil
@@ -35,7 +33,7 @@ def parse_args():
     parser.add_argument(
         "--data", 
         type=str, 
-        default="data/dataset.yaml",
+        default="data/traffic_sign_dataset/dataset.yaml",
         help="Path to the dataset config or root folder for train/test modes."
     )
     
@@ -55,6 +53,18 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train.")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for training.")
     parser.add_argument("--image", type=str, default=None, help="Path to image file for inference (instead of screen capture).")
+    parser.add_argument(
+        "--conf-threshold",
+        type=float,
+        default=0.20,
+        help="Minimum confidence used during inference.",
+    )
+    parser.add_argument(
+        "--imgsz",
+        type=int,
+        default=1280,
+        help="YOLO inference image size. Higher values improve small-sign recall but reduce FPS.",
+    )
 
     return parser.parse_args()
 
@@ -90,6 +100,7 @@ def run_evaluation(args, detector):
 def run_inference_screen_capture(args, detector):
     print("Starting screen capture inference...")
     print("Press 'q' in the window to stop.")
+    print(f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}")
 
     sct = mss.mss()
     # Typically, city car driving runs on the main monitor. 
@@ -106,7 +117,11 @@ def run_inference_screen_capture(args, detector):
         frame = cv2.cvtColor(screen_img, cv2.COLOR_BGRA2BGR)
         
         # 3. Predict mapping confidence and box
-        detections = detector.predict(frame, confidence_threshold=0.5)
+        detections = detector.predict(
+            frame,
+            confidence_threshold=args.conf_threshold,
+            image_size=args.imgsz,
+        )
         
         # 4. Draw detections on the frame
         for (x1, y1, x2, y2, conf, cls) in detections:
@@ -136,13 +151,18 @@ def run_inference_image(args, detector):
         return
         
     print(f"Running inference on image: {args.image}")
+    print(f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}")
     frame = cv2.imread(args.image)
     if frame is None:
         print(f"Error: Could not read image at {args.image}")
         return
 
     # Predict
-    detections = detector.predict(frame, confidence_threshold=0.5)
+    detections = detector.predict(
+        frame,
+        confidence_threshold=args.conf_threshold,
+        image_size=args.imgsz,
+    )
     
     # Draw detections
     for (x1, y1, x2, y2, conf, cls) in detections:

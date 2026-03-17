@@ -90,6 +90,24 @@ def parse_args():
         help="Maximum detections to draw per frame (set <= 0 to draw all).",
     )
     parser.add_argument(
+        "--min-confirm-frames",
+        type=int,
+        default=2,
+        help="Minimum consecutive inference updates required before drawing a detection.",
+    )
+    parser.add_argument(
+        "--max-missing-frames",
+        type=int,
+        default=2,
+        help="How many inference updates a confirmed detection can be missing before removal.",
+    )
+    parser.add_argument(
+        "--track-iou-threshold",
+        type=float,
+        default=0.35,
+        help="IoU threshold for matching detections across inference updates.",
+    )
+    parser.add_argument(
         "--window-width",
         type=int,
         default=1400,
@@ -224,6 +242,96 @@ def run_detection_once(
     return detections, duration
 
 
+def compute_iou(box_a, box_b) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+
+    inter_w = max(0, inter_x2 - inter_x1)
+    inter_h = max(0, inter_y2 - inter_y1)
+    inter_area = inter_w * inter_h
+    if inter_area <= 0:
+        return 0.0
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+    union = area_a + area_b - inter_area
+    if union <= 0:
+        return 0.0
+
+    return float(inter_area) / float(union)
+
+
+def apply_temporal_consensus(
+    detections,
+    tracks,
+    next_track_id: int,
+    min_confirm_frames: int,
+    max_missing_frames: int,
+    match_iou_threshold: float,
+):
+    sorted_detections = sorted(detections, key=lambda item: item[4], reverse=True)
+    matched_track_ids = set()
+
+    for (x1, y1, x2, y2, conf, cls) in sorted_detections:
+        best_track_id = None
+        best_iou = match_iou_threshold
+
+        for track_id, track in tracks.items():
+            if track_id in matched_track_ids:
+                continue
+            if int(track["cls"]) != int(cls):
+                continue
+
+            iou = compute_iou((x1, y1, x2, y2), track["bbox"])
+            if iou >= best_iou:
+                best_iou = iou
+                best_track_id = track_id
+
+        if best_track_id is None:
+            tracks[next_track_id] = {
+                "bbox": (int(x1), int(y1), int(x2), int(y2)),
+                "conf": float(conf),
+                "cls": int(cls),
+                "hits": 1,
+                "missed": 0,
+            }
+            matched_track_ids.add(next_track_id)
+            next_track_id += 1
+        else:
+            track = tracks[best_track_id]
+            track["bbox"] = (int(x1), int(y1), int(x2), int(y2))
+            track["conf"] = float(conf)
+            track["hits"] = int(track["hits"]) + 1
+            track["missed"] = 0
+            matched_track_ids.add(best_track_id)
+
+    stale_track_ids = []
+    stable_detections = []
+
+    for track_id, track in tracks.items():
+        if track_id not in matched_track_ids:
+            track["missed"] = int(track["missed"]) + 1
+
+        if int(track["missed"]) > max_missing_frames:
+            stale_track_ids.append(track_id)
+            continue
+
+        if int(track["hits"]) >= min_confirm_frames:
+            tx1, ty1, tx2, ty2 = track["bbox"]
+            stable_detections.append((tx1, ty1, tx2, ty2, float(track["conf"]), int(track["cls"])))
+
+    for track_id in stale_track_ids:
+        del tracks[track_id]
+
+    stable_detections.sort(key=lambda item: item[4], reverse=True)
+    return stable_detections, next_track_id
+
+
 def run_inference_screen_capture(args, detector):
     print("Starting screen capture inference...")
     print("Press 'q' in the window to stop.")
@@ -231,6 +339,8 @@ def run_inference_screen_capture(args, detector):
     print(
         f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}, "
         f"infer_scale={args.inference_scale:.2f}, mode={inference_mode}, "
+        f"confirm={args.min_confirm_frames}, max_miss={args.max_missing_frames}, "
+        f"track_iou={args.track_iou_threshold:.2f}, "
         f"window={args.window_width}x{args.window_height}"
     )
 
@@ -252,9 +362,14 @@ def run_inference_screen_capture(args, detector):
     cv2.resizeWindow(window_name, args.window_width, args.window_height)
 
     latest_detections = []
+    stable_detections = []
     last_inference_duration = 0.0
     display_fps_ema = 0.0
     inference_fps_ema = 0.0
+    raw_detection_count = 0
+
+    tracks = {}
+    next_track_id = 1
 
     inference_worker = None
     pending_inference = None
@@ -276,14 +391,35 @@ def run_inference_screen_capture(args, detector):
                     args.imgsz,
                     args.inference_scale,
                 )
+                raw_detection_count = len(latest_detections)
+                stable_detections, next_track_id = apply_temporal_consensus(
+                    latest_detections,
+                    tracks,
+                    next_track_id,
+                    args.min_confirm_frames,
+                    args.max_missing_frames,
+                    args.track_iou_threshold,
+                )
             else:
                 if pending_inference is not None and pending_inference.done():
                     try:
                         latest_detections, last_inference_duration = pending_inference.result()
+                        raw_detection_count = len(latest_detections)
+                        stable_detections, next_track_id = apply_temporal_consensus(
+                            latest_detections,
+                            tracks,
+                            next_track_id,
+                            args.min_confirm_frames,
+                            args.max_missing_frames,
+                            args.track_iou_threshold,
+                        )
                     except Exception as exc:
                         print(f"[ERROR] Async inference failed: {exc}")
                         latest_detections = []
+                        stable_detections = []
                         last_inference_duration = 0.0
+                        raw_detection_count = 0
+                        tracks.clear()
                     pending_inference = None
 
                 if pending_inference is None:
@@ -296,7 +432,7 @@ def run_inference_screen_capture(args, detector):
                         args.inference_scale,
                     )
 
-            detections_to_draw = latest_detections
+            detections_to_draw = stable_detections
             if args.max_draw_detections > 0 and len(detections_to_draw) > args.max_draw_detections:
                 detections_to_draw = detections_to_draw[:args.max_draw_detections]
 
@@ -337,6 +473,15 @@ def run_inference_screen_capture(args, detector):
                 (20, 75),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
+                (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"Detections raw/stable: {raw_detection_count}/{len(detections_to_draw)}",
+                (20, 108),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
                 (0, 0, 255),
                 2,
             )
@@ -403,6 +548,24 @@ def main():
     elif args.inference_scale > 1.0:
         print(f"[WARNING] --inference-scale={args.inference_scale} is above 1.0. Clamping to 1.0.")
         args.inference_scale = 1.0
+
+    if args.min_confirm_frames < 1:
+        print(f"[WARNING] Invalid --min-confirm-frames={args.min_confirm_frames}. Falling back to 1.")
+        args.min_confirm_frames = 1
+
+    if args.max_missing_frames < 0:
+        print(f"[WARNING] Invalid --max-missing-frames={args.max_missing_frames}. Falling back to 0.")
+        args.max_missing_frames = 0
+
+    if args.track_iou_threshold <= 0.0:
+        print(
+            f"[WARNING] Invalid --track-iou-threshold={args.track_iou_threshold}. "
+            "Falling back to 0.35."
+        )
+        args.track_iou_threshold = 0.35
+    elif args.track_iou_threshold > 1.0:
+        print(f"[WARNING] --track-iou-threshold={args.track_iou_threshold} is above 1.0. Clamping to 1.0.")
+        args.track_iou_threshold = 1.0
     
     try:
         print(f"Initializing {args.model.upper()}...")

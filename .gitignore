@@ -5,3 +5,7 @@ data/*
 *.pt
 !models/*.pt
 runs/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]

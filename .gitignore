@@ -3,4 +3,5 @@ venv/
 data/*
 !data/*.py
 *.pt
+!models/*.pt
 runs/

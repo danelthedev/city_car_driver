@@ -60,6 +60,9 @@ class YOLODetector(BaseTrafficSignDetector):
         if image_size < 320:
             image_size = 320
 
+        if "half" not in kwargs:
+            kwargs["half"] = isinstance(self.device, str) and self.device.lower().startswith("cuda")
+
         results = self.model(
             image,
             conf=confidence_threshold,
@@ -68,12 +71,18 @@ class YOLODetector(BaseTrafficSignDetector):
             verbose=False,
             **kwargs,
         )
-        
+
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        xyxy = boxes.xyxy.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        classes = boxes.cls.cpu().numpy()
+
         detections = []
-        for box in results[0].boxes:
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            cls = int(box.cls[0].cpu().numpy())
-            detections.append((int(x1), int(y1), int(x2), int(y2), conf, cls))
-        
+        for i in range(len(xyxy)):
+            x1, y1, x2, y2 = xyxy[i]
+            detections.append((int(x1), int(y1), int(x2), int(y2), float(confs[i]), int(classes[i])))
+
         return detections

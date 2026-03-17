@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import os
 import shutil
 import sys
@@ -64,6 +65,29 @@ def parse_args():
         type=int,
         default=1280,
         help="YOLO inference image size. Higher values improve small-sign recall but reduce FPS.",
+    )
+    parser.add_argument(
+        "--inference-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied before inference only (0 < value <= 1). Lower values increase FPS with some accuracy loss.",
+    )
+    parser.add_argument(
+        "--sync-inference",
+        action="store_true",
+        help="Run inference synchronously. Default behavior uses async inference for smoother display.",
+    )
+    parser.add_argument(
+        "--monitor-index",
+        type=int,
+        default=1,
+        help="Monitor index for screen capture (mss indexing: 1..N).",
+    )
+    parser.add_argument(
+        "--max-draw-detections",
+        type=int,
+        default=40,
+        help="Maximum detections to draw per frame (set <= 0 to draw all).",
     )
     parser.add_argument(
         "--window-width",
@@ -141,58 +165,191 @@ def resize_to_fit(image: np.ndarray, target_width: int, target_height: int) -> n
     return cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
 
 
+def scale_detections_to_original(
+    detections,
+    scale: float,
+    frame_width: int,
+    frame_height: int,
+):
+    if not detections or scale == 1.0:
+        return detections
+
+    inv_scale = 1.0 / scale
+    max_x = max(frame_width - 1, 0)
+    max_y = max(frame_height - 1, 0)
+    scaled = []
+
+    for (x1, y1, x2, y2, conf, cls) in detections:
+        sx1 = max(0, min(max_x, int(round(x1 * inv_scale))))
+        sy1 = max(0, min(max_y, int(round(y1 * inv_scale))))
+        sx2 = max(0, min(max_x, int(round(x2 * inv_scale))))
+        sy2 = max(0, min(max_y, int(round(y2 * inv_scale))))
+
+        if sx2 <= sx1 or sy2 <= sy1:
+            continue
+        scaled.append((sx1, sy1, sx2, sy2, conf, cls))
+
+    return scaled
+
+
+def run_detection_once(
+    detector,
+    frame: np.ndarray,
+    confidence_threshold: float,
+    image_size: int,
+    inference_scale: float,
+):
+    start_time = time.perf_counter()
+    frame_h, frame_w = frame.shape[:2]
+
+    scale = float(inference_scale)
+    if scale <= 0.0:
+        scale = 1.0
+
+    inference_frame = frame
+    if scale != 1.0:
+        resized_w = max(1, int(round(frame_w * scale)))
+        resized_h = max(1, int(round(frame_h * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        inference_frame = cv2.resize(frame, (resized_w, resized_h), interpolation=interpolation)
+
+    detections = detector.predict(
+        inference_frame,
+        confidence_threshold=confidence_threshold,
+        image_size=image_size,
+    )
+    detections = scale_detections_to_original(detections, scale, frame_w, frame_h)
+
+    duration = max(time.perf_counter() - start_time, 1e-6)
+    return detections, duration
+
+
 def run_inference_screen_capture(args, detector):
     print("Starting screen capture inference...")
     print("Press 'q' in the window to stop.")
+    inference_mode = "sync" if args.sync_inference else "async"
     print(
         f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}, "
+        f"infer_scale={args.inference_scale:.2f}, mode={inference_mode}, "
         f"window={args.window_width}x{args.window_height}"
     )
 
     sct = mss.mss()
-    # Typically, city car driving runs on the main monitor. 
-    # Grab the dimensions of the primary monitor.
-    monitor = sct.monitors[1]
+    monitor_index = args.monitor_index
+    if monitor_index < 1 or monitor_index >= len(sct.monitors):
+        fallback_index = 1 if len(sct.monitors) > 1 else 0
+        print(f"[WARNING] Invalid monitor index {monitor_index}. Falling back to {fallback_index}.")
+        monitor_index = fallback_index
+
+    monitor = sct.monitors[monitor_index]
+    print(
+        f"Capture monitor {monitor_index}: "
+        f"{monitor['width']}x{monitor['height']} at ({monitor['left']}, {monitor['top']})"
+    )
+
     window_name = f"{args.model} - Real-time Inference"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, args.window_width, args.window_height)
+
+    latest_detections = []
+    last_inference_duration = 0.0
+    display_fps_ema = 0.0
+    inference_fps_ema = 0.0
+
+    inference_worker = None
+    pending_inference = None
+    if not args.sync_inference:
+        inference_worker = ThreadPoolExecutor(max_workers=1)
     
-    while True:
-        start_time = time.time()
-        
-        # 1. Grab screen
-        screen_img = np.array(sct.grab(monitor))
-        
-        # 2. Convert from BGRA (mss default) to BGR (OpenCV/ultralytics expected)
-        frame = cv2.cvtColor(screen_img, cv2.COLOR_BGRA2BGR)
-        
-        # 3. Predict mapping confidence and box
-        detections = detector.predict(
-            frame,
-            confidence_threshold=args.conf_threshold,
-            image_size=args.imgsz,
-        )
-        
-        # 4. Draw detections on the frame
-        for (x1, y1, x2, y2, conf, cls) in detections:
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            class_name = resolve_class_name(detector, cls)
-            label = f"{class_name}: {conf:.2f}"
-            cv2.putText(frame, label, (x1, max(y1-10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            
-        # 5. Calculate and display FPS
-        fps = 1.0 / (time.time() - start_time)
-        cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
+    try:
+        while True:
+            loop_start = time.perf_counter()
 
-        # 6. Show the frame tracking
-        disp_frame = resize_to_fit(frame, args.window_width, args.window_height)
-        cv2.imshow(window_name, disp_frame)
+            screen_img = np.array(sct.grab(monitor))
+            frame = cv2.cvtColor(screen_img, cv2.COLOR_BGRA2BGR)
 
-        # Break loop with 'q'
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            if inference_worker is None:
+                latest_detections, last_inference_duration = run_detection_once(
+                    detector,
+                    frame,
+                    args.conf_threshold,
+                    args.imgsz,
+                    args.inference_scale,
+                )
+            else:
+                if pending_inference is not None and pending_inference.done():
+                    try:
+                        latest_detections, last_inference_duration = pending_inference.result()
+                    except Exception as exc:
+                        print(f"[ERROR] Async inference failed: {exc}")
+                        latest_detections = []
+                        last_inference_duration = 0.0
+                    pending_inference = None
 
-    cv2.destroyAllWindows()
+                if pending_inference is None:
+                    pending_inference = inference_worker.submit(
+                        run_detection_once,
+                        detector,
+                        frame.copy(),
+                        args.conf_threshold,
+                        args.imgsz,
+                        args.inference_scale,
+                    )
+
+            detections_to_draw = latest_detections
+            if args.max_draw_detections > 0 and len(detections_to_draw) > args.max_draw_detections:
+                detections_to_draw = detections_to_draw[:args.max_draw_detections]
+
+            for (x1, y1, x2, y2, conf, cls) in detections_to_draw:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                class_name = resolve_class_name(detector, cls)
+                label = f"{class_name}: {conf:.2f}"
+                cv2.putText(frame, label, (x1, max(y1 - 10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            loop_duration = max(time.perf_counter() - loop_start, 1e-6)
+            display_fps = 1.0 / loop_duration
+            inference_fps = 1.0 / last_inference_duration if last_inference_duration > 0.0 else 0.0
+
+            if display_fps_ema == 0.0:
+                display_fps_ema = display_fps
+            else:
+                display_fps_ema = (0.90 * display_fps_ema) + (0.10 * display_fps)
+
+            if inference_fps > 0.0:
+                if inference_fps_ema == 0.0:
+                    inference_fps_ema = inference_fps
+                else:
+                    inference_fps_ema = (0.90 * inference_fps_ema) + (0.10 * inference_fps)
+
+            mode_tag = "SYNC" if args.sync_inference else "ASYNC"
+            cv2.putText(
+                frame,
+                f"Display FPS: {display_fps_ema:.1f} | Infer FPS: {inference_fps_ema:.1f}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.85,
+                (0, 0, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"Mode: {mode_tag} | Infer scale: {args.inference_scale:.2f}",
+                (20, 75),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 255),
+                2,
+            )
+
+            disp_frame = resize_to_fit(frame, args.window_width, args.window_height)
+            cv2.imshow(window_name, disp_frame)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    finally:
+        if inference_worker is not None:
+            inference_worker.shutdown(wait=False, cancel_futures=True)
+        cv2.destroyAllWindows()
 
 
 def run_inference_image(args, detector):
@@ -203,6 +360,7 @@ def run_inference_image(args, detector):
     print(f"Running inference on image: {args.image}")
     print(
         f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}, "
+        f"infer_scale={args.inference_scale:.2f}, "
         f"window={args.window_width}x{args.window_height}"
     )
     frame = cv2.imread(args.image)
@@ -210,11 +368,12 @@ def run_inference_image(args, detector):
         print(f"Error: Could not read image at {args.image}")
         return
 
-    # Predict
-    detections = detector.predict(
+    detections, _ = run_detection_once(
+        detector,
         frame,
-        confidence_threshold=args.conf_threshold,
-        image_size=args.imgsz,
+        args.conf_threshold,
+        args.imgsz,
+        args.inference_scale,
     )
     
     # Draw detections
@@ -237,6 +396,13 @@ def run_inference_image(args, detector):
 
 def main():
     args = parse_args()
+
+    if args.inference_scale <= 0.0:
+        print(f"[WARNING] Invalid --inference-scale={args.inference_scale}. Falling back to 1.0.")
+        args.inference_scale = 1.0
+    elif args.inference_scale > 1.0:
+        print(f"[WARNING] --inference-scale={args.inference_scale} is above 1.0. Clamping to 1.0.")
+        args.inference_scale = 1.0
     
     try:
         print(f"Initializing {args.model.upper()}...")

@@ -65,6 +65,18 @@ def parse_args():
         default=1280,
         help="YOLO inference image size. Higher values improve small-sign recall but reduce FPS.",
     )
+    parser.add_argument(
+        "--window-width",
+        type=int,
+        default=1400,
+        help="Inference display window width in pixels.",
+    )
+    parser.add_argument(
+        "--window-height",
+        type=int,
+        default=900,
+        help="Inference display window height in pixels.",
+    )
 
     return parser.parse_args()
 
@@ -97,15 +109,53 @@ def run_evaluation(args, detector):
     print("Metrics:", metrics)
 
 
+def resolve_class_name(detector, class_id: int) -> str:
+    model = getattr(detector, "model", None)
+    names = getattr(model, "names", None) if model is not None else None
+
+    if isinstance(names, dict):
+        if class_id in names:
+            return str(names[class_id])
+        str_id = str(class_id)
+        if str_id in names:
+            return str(names[str_id])
+    elif isinstance(names, (list, tuple)):
+        if 0 <= class_id < len(names):
+            return str(names[class_id])
+
+    return f"class-{class_id}"
+
+
+def resize_to_fit(image: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
+    image_h, image_w = image.shape[:2]
+    if image_h <= 0 or image_w <= 0:
+        return image
+
+    scale = min(float(target_width) / float(image_w), float(target_height) / float(image_h))
+    scale = max(scale, 0.01)
+    resized_w = max(1, int(round(image_w * scale)))
+    resized_h = max(1, int(round(image_h * scale)))
+
+    if resized_w == image_w and resized_h == image_h:
+        return image
+    return cv2.resize(image, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
+
+
 def run_inference_screen_capture(args, detector):
     print("Starting screen capture inference...")
     print("Press 'q' in the window to stop.")
-    print(f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}")
+    print(
+        f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}, "
+        f"window={args.window_width}x{args.window_height}"
+    )
 
     sct = mss.mss()
     # Typically, city car driving runs on the main monitor. 
     # Grab the dimensions of the primary monitor.
-    monitor = sct.monitors[1] 
+    monitor = sct.monitors[1]
+    window_name = f"{args.model} - Real-time Inference"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, args.window_width, args.window_height)
     
     while True:
         start_time = time.time()
@@ -126,7 +176,8 @@ def run_inference_screen_capture(args, detector):
         # 4. Draw detections on the frame
         for (x1, y1, x2, y2, conf, cls) in detections:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            label = f"Class {cls}: {conf:.2f}"
+            class_name = resolve_class_name(detector, cls)
+            label = f"{class_name}: {conf:.2f}"
             cv2.putText(frame, label, (x1, max(y1-10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
             
         # 5. Calculate and display FPS
@@ -134,9 +185,8 @@ def run_inference_screen_capture(args, detector):
         cv2.putText(frame, f"FPS: {fps:.1f}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
 
         # 6. Show the frame tracking
-        # Resize to fit on screen if monitor is huge
-        disp_frame = cv2.resize(frame, (800, 600))
-        cv2.imshow(f"{args.model} - Real-time Inference", disp_frame)
+        disp_frame = resize_to_fit(frame, args.window_width, args.window_height)
+        cv2.imshow(window_name, disp_frame)
 
         # Break loop with 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -151,7 +201,10 @@ def run_inference_image(args, detector):
         return
         
     print(f"Running inference on image: {args.image}")
-    print(f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}")
+    print(
+        f"Inference settings: conf={args.conf_threshold:.2f}, imgsz={args.imgsz}, "
+        f"window={args.window_width}x{args.window_height}"
+    )
     frame = cv2.imread(args.image)
     if frame is None:
         print(f"Error: Could not read image at {args.image}")
@@ -167,17 +220,16 @@ def run_inference_image(args, detector):
     # Draw detections
     for (x1, y1, x2, y2, conf, cls) in detections:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        label = f"Class {cls}: {conf:.2f}"
+        class_name = resolve_class_name(detector, cls)
+        label = f"{class_name}: {conf:.2f}"
         cv2.putText(frame, label, (x1, max(y1-10, 0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
-    # Resize and display
-    h, w = frame.shape[:2]
-    # Simple logic to ensure massive images fit on screen
-    if h > 900 or w > 1600:
-        scale = min(1600/w, 900/h)
-        frame = cv2.resize(frame, (int(w*scale), int(h*scale)))
-        
-    cv2.imshow(f"{args.model} - Image Inference", frame)
+    window_name = f"{args.model} - Image Inference"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, args.window_width, args.window_height)
+    disp_frame = resize_to_fit(frame, args.window_width, args.window_height)
+
+    cv2.imshow(window_name, disp_frame)
     print("Press any key inside the image window to close...")
     cv2.waitKey(0)
     cv2.destroyAllWindows()

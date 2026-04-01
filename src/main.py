@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 import shutil
 import sys
+import threading
 import time
 
 import cv2
@@ -135,11 +136,41 @@ def parse_args():
         action="store_true",
         help="Run inference synchronously. Default behavior uses async inference for smoother display.",
     )
+    parser.set_defaults(lane_priority=True)
+    parser.add_argument(
+        "--lane-priority",
+        dest="lane_priority",
+        action="store_true",
+        help="Prioritize lane responsiveness by throttling sign/TL async submissions when lane model is enabled.",
+    )
+    parser.add_argument(
+        "--no-lane-priority",
+        dest="lane_priority",
+        action="store_false",
+        help="Disable lane-priority scheduling.",
+    )
+    parser.add_argument(
+        "--sign-submit-interval-ms",
+        type=float,
+        default=0.0,
+        help="Minimum time between sign async submissions in milliseconds (0 = unlimited).",
+    )
+    parser.add_argument(
+        "--tl-submit-interval-ms",
+        type=float,
+        default=0.0,
+        help="Minimum time between traffic-light async submissions in milliseconds (0 = unlimited).",
+    )
     parser.add_argument(
         "--monitor-index",
         type=int,
         default=1,
         help="Monitor index for screen capture (mss indexing: 1..N).",
+    )
+    parser.add_argument(
+        "--async-capture",
+        action="store_true",
+        help="Capture frames in a background thread and consume the latest frame in the render loop.",
     )
     parser.add_argument(
         "--max-draw-detections",
@@ -188,6 +219,17 @@ def parse_args():
         type=float,
         default=0.55,
         help="Threshold used for the intersection-ahead score from lane geometry cues.",
+    )
+    parser.add_argument(
+        "--profile-stages",
+        action="store_true",
+        help="Print averaged stage timings every N frames for FPS bottleneck analysis.",
+    )
+    parser.add_argument(
+        "--profile-every",
+        type=int,
+        default=120,
+        help="How many frames to aggregate before printing profiling statistics.",
     )
 
     return parser.parse_args()
@@ -354,6 +396,40 @@ def scale_detections_to_original(detections, scale: float, frame_width: int, fra
     return scaled
 
 
+def scale_bbox_to_frame(
+    x1: int,
+    y1: int,
+    x2: int,
+    y2: int,
+    src_width: int,
+    src_height: int,
+    dst_width: int,
+    dst_height: int,
+):
+    if src_width <= 0 or src_height <= 0 or dst_width <= 0 or dst_height <= 0:
+        return x1, y1, x2, y2
+
+    sx = float(dst_width) / float(src_width)
+    sy = float(dst_height) / float(src_height)
+
+    tx1 = int(round(x1 * sx))
+    ty1 = int(round(y1 * sy))
+    tx2 = int(round(x2 * sx))
+    ty2 = int(round(y2 * sy))
+
+    tx1 = max(0, min(dst_width - 1, tx1))
+    ty1 = max(0, min(dst_height - 1, ty1))
+    tx2 = max(0, min(dst_width - 1, tx2))
+    ty2 = max(0, min(dst_height - 1, ty2))
+
+    if tx2 <= tx1:
+        tx2 = min(dst_width - 1, tx1 + 1)
+    if ty2 <= ty1:
+        ty2 = min(dst_height - 1, ty1 + 1)
+
+    return tx1, ty1, tx2, ty2
+
+
 def run_detection_once(detector, frame: np.ndarray, confidence_threshold: float, image_size: int, inference_scale: float):
     start_time = time.perf_counter()
     frame_h, frame_w = frame.shape[:2]
@@ -461,6 +537,143 @@ def draw_lane_instances(frame: np.ndarray, lane_instances, alpha: float = 0.35, 
             cv2.drawContours(frame, contours, -1, color, 2)
 
     cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0.0, dst=frame)
+    return frame
+
+
+def build_lane_draw_cache(lane_instances, frame_shape, draw_contours: bool = False):
+    h, w = frame_shape[:2]
+    if h <= 0 or w <= 0 or not lane_instances:
+        return None
+
+    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    color_layer = np.zeros((h, w, 3), dtype=np.uint8)
+    contour_items = []
+
+    for inst in lane_instances:
+        mask = inst.get("mask")
+        if mask is None:
+            continue
+
+        if mask.shape[:2] != (h, w):
+            mask_u8 = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        else:
+            mask_u8 = mask.astype(np.uint8) if mask.dtype != np.uint8 else mask
+
+        mask_bin = np.where(mask_u8 > 0, 255, 0).astype(np.uint8)
+        if not np.any(mask_bin):
+            continue
+
+        color = _lane_color(inst.get("class_name", ""))
+        combined_mask = cv2.bitwise_or(combined_mask, mask_bin)
+        color_layer[mask_bin > 0] = color
+
+        if draw_contours:
+            contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                contour_items.append((contours, color))
+
+    if not np.any(combined_mask):
+        return None
+
+    return {
+        "mask": combined_mask,
+        "color": color_layer,
+        "contours": contour_items,
+    }
+
+
+def draw_lane_from_cache(frame: np.ndarray, lane_cache, alpha: float = 0.35, draw_contours: bool = False):
+    if lane_cache is None:
+        return frame
+
+    alpha = max(0.0, min(1.0, float(alpha)))
+    mask = lane_cache.get("mask")
+    color_layer = lane_cache.get("color")
+
+    if alpha > 0.0 and mask is not None and color_layer is not None and np.any(mask):
+        blended = cv2.addWeighted(frame, 1.0 - alpha, color_layer, alpha, 0.0)
+        cv2.copyTo(blended, mask, frame)
+
+    if draw_contours:
+        for contours, color in lane_cache.get("contours", []):
+            cv2.drawContours(frame, contours, -1, color, 2)
+
+    return frame
+
+
+def build_sign_overlay_cache(display_shape, source_shape, detections, detector):
+    if not detections:
+        return None
+
+    disp_h, disp_w = display_shape[:2]
+    src_h, src_w = source_shape[:2]
+    if disp_h <= 0 or disp_w <= 0 or src_h <= 0 or src_w <= 0:
+        return None
+
+    overlay = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+    for (x1, y1, x2, y2, conf, cls) in detections:
+        tx1, ty1, tx2, ty2 = scale_bbox_to_frame(x1, y1, x2, y2, src_w, src_h, disp_w, disp_h)
+        class_name = resolve_class_name(detector, cls)
+        _draw_detection(
+            overlay,
+            tx1,
+            ty1,
+            tx2,
+            ty2,
+            f"{class_name}: {conf:.2f}",
+            _SIGN_BOX_COLOR,
+            _SIGN_TEXT_COLOR,
+        )
+
+    gray = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+    mask = np.where(gray > 0, 255, 0).astype(np.uint8)
+    if not np.any(mask):
+        return None
+    return {"overlay": overlay, "mask": mask}
+
+
+def build_tl_overlay_cache(display_shape, source_shape, detections, tl_detector):
+    if not detections:
+        return None
+
+    disp_h, disp_w = display_shape[:2]
+    src_h, src_w = source_shape[:2]
+    if disp_h <= 0 or disp_w <= 0 or src_h <= 0 or src_w <= 0:
+        return None
+
+    overlay = np.zeros((disp_h, disp_w, 3), dtype=np.uint8)
+    for (x1, y1, x2, y2, conf, cls) in detections:
+        tx1, ty1, tx2, ty2 = scale_bbox_to_frame(x1, y1, x2, y2, src_w, src_h, disp_w, disp_h)
+        class_name = resolve_class_name(tl_detector, cls)
+        color = _tl_color(class_name)
+        _draw_detection(
+            overlay,
+            tx1,
+            ty1,
+            tx2,
+            ty2,
+            f"TL-{class_name}: {conf:.2f}",
+            color,
+            color,
+        )
+
+    gray = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
+    mask = np.where(gray > 0, 255, 0).astype(np.uint8)
+    if not np.any(mask):
+        return None
+    return {"overlay": overlay, "mask": mask}
+
+
+def apply_overlay_cache(frame: np.ndarray, overlay_cache):
+    if overlay_cache is None:
+        return frame
+
+    mask = overlay_cache.get("mask")
+    overlay = overlay_cache.get("overlay")
+    if mask is None or overlay is None:
+        return frame
+
+    cv2.copyTo(overlay, mask, frame)
     return frame
 
 
@@ -624,22 +837,40 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
 
     has_tl = tl_detector is not None
     has_lane = lane_model is not None
+    lane_priority_enabled = bool(args.lane_priority and has_lane)
     tl_conf = args.tl_conf_threshold if args.tl_conf_threshold is not None else args.conf_threshold
     lane_conf = args.lane_conf_threshold if args.lane_conf_threshold is not None else args.conf_threshold
     lane_imgsz = args.lane_imgsz if args.lane_imgsz is not None else args.imgsz
     lane_scale = args.lane_inference_scale if args.lane_inference_scale is not None else args.inference_scale
+    sign_submit_interval_ms = max(0.0, float(args.sign_submit_interval_ms))
+    tl_submit_interval_ms = max(0.0, float(args.tl_submit_interval_ms))
+
+    if lane_priority_enabled:
+        # If user did not force explicit intervals, apply lane-first defaults.
+        if sign_submit_interval_ms <= 0.0:
+            sign_submit_interval_ms = 80.0
+        if has_tl and tl_submit_interval_ms <= 0.0:
+            tl_submit_interval_ms = 80.0
 
     inference_mode = "sync" if args.sync_inference else "async"
+    capture_mode = "async" if args.async_capture else "sync"
     print(
         f"Inference settings: conf={args.conf_threshold:.2f}, "
         + (f"tl_conf={tl_conf:.2f}, " if has_tl else "")
         + (f"lane_conf={lane_conf:.2f}, " if has_lane else "")
         + f"imgsz={args.imgsz}, infer_scale={args.inference_scale:.2f}, "
         + (f"lane_imgsz={lane_imgsz}, lane_scale={lane_scale:.2f}, " if has_lane else "")
-        + f"mode={inference_mode}, confirm={args.min_confirm_frames}, "
+        + f"mode={inference_mode}, capture={capture_mode}, lane_priority={lane_priority_enabled}, confirm={args.min_confirm_frames}, "
         f"max_miss={args.max_missing_frames}, track_iou={args.track_iou_threshold:.2f}, "
         f"window={args.window_width}x{args.window_height}"
     )
+    if not args.sync_inference and (sign_submit_interval_ms > 0.0 or (has_tl and tl_submit_interval_ms > 0.0)):
+        print(
+            f"[INFO] Async submit intervals: sign={sign_submit_interval_ms:.1f}ms"
+            + (f", tl={tl_submit_interval_ms:.1f}ms" if has_tl else "")
+        )
+    if args.profile_stages:
+        print(f"[INFO] Stage profiling enabled. Printing every {max(1, args.profile_every)} frames.")
     if has_tl:
         print("[INFO] Dual-model mode: sign model + traffic-light model running in parallel.")
     if has_lane:
@@ -665,6 +896,9 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
     # Per-model state
     sign_detections_raw = []
     sign_stable = []
+    sign_to_draw = []
+    sign_overlay_cache = None
+    sign_overlay_shape = None
     sign_tracks = {}
     sign_next_id = 1
     sign_raw_count = 0
@@ -672,12 +906,17 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
 
     tl_detections_raw = []
     tl_stable = []
+    tl_to_draw = []
+    tl_overlay_cache = None
+    tl_overlay_shape = None
     tl_tracks = {}
     tl_next_id = 1
     tl_raw_count = 0
     tl_infer_duration = 0.0
 
     lane_instances = []
+    lane_draw_cache = None
+    lane_draw_cache_shape = None
     lane_infer_duration = 0.0
     lane_intersection_score = 0.0
     lane_intersection = False
@@ -688,6 +927,27 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
     tl_fps_ema = 0.0
     lane_fps_ema = 0.0
 
+    profile_totals = {
+        "capture": 0.0,
+        "sign_infer": 0.0,
+        "tl_infer": 0.0,
+        "lane_infer": 0.0,
+        "sign_consensus": 0.0,
+        "tl_consensus": 0.0,
+        "intersection": 0.0,
+        "draw": 0.0,
+        "display": 0.0,
+        "loop": 0.0,
+    }
+    frame_count = 0
+    sign_stale_frames = 0
+    tl_stale_frames = 0
+    lane_stale_frames = 0
+    capture_reuse_frames = 0
+    sign_update_count = 0
+    tl_update_count = 0
+    lane_update_count = 0
+
     # Each model gets its own single-thread executor for async mode
     sign_worker = None
     tl_worker = None
@@ -695,6 +955,8 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
     sign_pending = None
     tl_pending = None
     lane_pending = None
+    sign_last_submit_time = 0.0
+    tl_last_submit_time = 0.0
 
     if not args.sync_inference:
         sign_worker = ThreadPoolExecutor(max_workers=1)
@@ -703,12 +965,112 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
         if has_lane:
             lane_worker = ThreadPoolExecutor(max_workers=1)
 
+    capture_lock = None
+    latest_frame = None
+    latest_display_frame = None
+    last_async_frame = None
+    last_async_display_frame = None
+    capture_stop_event = None
+    capture_thread = None
+    capture_error = None
+
+    if args.async_capture:
+        capture_lock = threading.Lock()
+        capture_stop_event = threading.Event()
+
+        def capture_loop():
+            nonlocal latest_frame, latest_display_frame, capture_error
+            local_capture_lock = capture_lock
+            assert local_capture_lock is not None
+            try:
+                with mss.mss() as capture_sct:
+                    while not capture_stop_event.is_set():
+                        grabbed = np.array(capture_sct.grab(monitor))
+                        bgr_frame = cv2.cvtColor(grabbed, cv2.COLOR_BGRA2BGR)
+                        disp_base = resize_to_fit(bgr_frame, args.window_width, args.window_height)
+                        with local_capture_lock:
+                            latest_frame = bgr_frame
+                            latest_display_frame = disp_base
+            except Exception as exc:
+                capture_error = exc
+                capture_stop_event.set()
+
+        capture_thread = threading.Thread(target=capture_loop, name="screen-capture-thread", daemon=True)
+        capture_thread.start()
+        print("[INFO] Async capture enabled (latest-frame mode).")
+
     try:
         while True:
             loop_start = time.perf_counter()
 
-            screen_img = np.array(sct.grab(monitor))
-            frame = cv2.cvtColor(screen_img, cv2.COLOR_BGRA2BGR)
+            capture_start = time.perf_counter()
+            stop_requested = False
+
+            if not args.async_capture:
+                screen_img = np.array(sct.grab(monitor))
+                frame = cv2.cvtColor(screen_img, cv2.COLOR_BGRA2BGR)
+                disp_base = resize_to_fit(frame, args.window_width, args.window_height)
+            else:
+                assert capture_lock is not None
+                frame = None
+                disp_base = None
+
+                if capture_error is not None:
+                    raise RuntimeError(f"Background capture failed: {capture_error}")
+
+                with capture_lock:
+                    if latest_frame is not None:
+                        frame = latest_frame
+                        disp_base = latest_display_frame
+                        latest_frame = None
+                        latest_display_frame = None
+
+                if frame is None and last_async_frame is not None:
+                    frame = last_async_frame
+                    disp_base = last_async_display_frame
+                    capture_reuse_frames += 1
+
+                while frame is None:
+                    if capture_error is not None:
+                        raise RuntimeError(f"Background capture failed: {capture_error}")
+
+                    with capture_lock:
+                        if latest_frame is not None:
+                            frame = latest_frame
+                            disp_base = latest_display_frame
+                            latest_frame = None
+                            latest_display_frame = None
+
+                    if frame is None:
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            stop_requested = True
+                            break
+                        time.sleep(0.001)
+
+                if stop_requested:
+                    break
+
+                last_async_frame = frame
+                last_async_display_frame = disp_base
+
+            assert frame is not None
+            if disp_base is None:
+                disp_base = resize_to_fit(frame, args.window_width, args.window_height)
+            capture_duration = max(time.perf_counter() - capture_start, 0.0)
+
+            # Always draw on a fresh frame copy to avoid cumulative alpha blending
+            # when async capture reuses the same base frame across display ticks.
+            disp_frame = disp_base.copy()
+
+            # In async mode, all workers consume the same immutable frame copy.
+            # This avoids one full image copy per model per frame.
+            async_input_frame = frame.copy() if sign_worker is not None else frame
+            sign_consensus_duration = 0.0
+            tl_consensus_duration = 0.0
+            intersection_duration = 0.0
+            lane_updated = False
+            sign_updated = False
+            tl_updated = False
 
             # ----------------------------------------------------------
             # Sign model
@@ -717,32 +1079,51 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 sign_detections_raw, sign_infer_duration = run_detection_once(
                     detector, frame, args.conf_threshold, args.imgsz, args.inference_scale
                 )
+                sign_update_count += 1
                 sign_raw_count = len(sign_detections_raw)
+                sign_consensus_start = time.perf_counter()
                 sign_stable, sign_next_id = apply_temporal_consensus(
                     sign_detections_raw, sign_tracks, sign_next_id,
                     args.min_confirm_frames, args.max_missing_frames, args.track_iou_threshold,
                 )
+                sign_consensus_duration = max(time.perf_counter() - sign_consensus_start, 0.0)
+                sign_updated = True
             else:
+                if sign_pending is not None and not sign_pending.done():
+                    sign_stale_frames += 1
+
                 if sign_pending is not None and sign_pending.done():
                     try:
                         sign_detections_raw, sign_infer_duration = sign_pending.result()
+                        sign_update_count += 1
                         sign_raw_count = len(sign_detections_raw)
+                        sign_consensus_start = time.perf_counter()
                         sign_stable, sign_next_id = apply_temporal_consensus(
                             sign_detections_raw, sign_tracks, sign_next_id,
                             args.min_confirm_frames, args.max_missing_frames, args.track_iou_threshold,
                         )
+                        sign_consensus_duration = max(time.perf_counter() - sign_consensus_start, 0.0)
+                        sign_updated = True
                     except Exception as exc:
                         print(f"[ERROR] Sign model inference failed: {exc}")
                         sign_detections_raw = []
                         sign_stable = []
                         sign_tracks.clear()
+                        sign_updated = True
                     sign_pending = None
 
                 if sign_pending is None:
-                    sign_pending = sign_worker.submit(
-                        run_detection_once,
-                        detector, frame.copy(), args.conf_threshold, args.imgsz, args.inference_scale,
-                    )
+                    now_ts = time.perf_counter()
+                    if ((now_ts - sign_last_submit_time) * 1000.0) >= sign_submit_interval_ms:
+                        sign_pending = sign_worker.submit(
+                            run_detection_once,
+                            detector,
+                            async_input_frame,
+                            args.conf_threshold,
+                            args.imgsz,
+                            args.inference_scale,
+                        )
+                        sign_last_submit_time = now_ts
 
             # ----------------------------------------------------------
             # Traffic light model (if provided)
@@ -752,32 +1133,51 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                     tl_detections_raw, tl_infer_duration = run_detection_once(
                         tl_detector, frame, tl_conf, args.imgsz, args.inference_scale
                     )
+                    tl_update_count += 1
                     tl_raw_count = len(tl_detections_raw)
+                    tl_consensus_start = time.perf_counter()
                     tl_stable, tl_next_id = apply_temporal_consensus(
                         tl_detections_raw, tl_tracks, tl_next_id,
                         args.min_confirm_frames, args.max_missing_frames, args.track_iou_threshold,
                     )
+                    tl_consensus_duration = max(time.perf_counter() - tl_consensus_start, 0.0)
+                    tl_updated = True
                 else:
+                    if tl_pending is not None and not tl_pending.done():
+                        tl_stale_frames += 1
+
                     if tl_pending is not None and tl_pending.done():
                         try:
                             tl_detections_raw, tl_infer_duration = tl_pending.result()
+                            tl_update_count += 1
                             tl_raw_count = len(tl_detections_raw)
+                            tl_consensus_start = time.perf_counter()
                             tl_stable, tl_next_id = apply_temporal_consensus(
                                 tl_detections_raw, tl_tracks, tl_next_id,
                                 args.min_confirm_frames, args.max_missing_frames, args.track_iou_threshold,
                             )
+                            tl_consensus_duration = max(time.perf_counter() - tl_consensus_start, 0.0)
+                            tl_updated = True
                         except Exception as exc:
                             print(f"[ERROR] Traffic light model inference failed: {exc}")
                             tl_detections_raw = []
                             tl_stable = []
                             tl_tracks.clear()
+                            tl_updated = True
                         tl_pending = None
 
                     if tl_pending is None:
-                        tl_pending = tl_worker.submit(
-                            run_detection_once,
-                            tl_detector, frame.copy(), tl_conf, args.imgsz, args.inference_scale,
-                        )
+                        now_ts = time.perf_counter()
+                        if ((now_ts - tl_last_submit_time) * 1000.0) >= tl_submit_interval_ms:
+                            tl_pending = tl_worker.submit(
+                                run_detection_once,
+                                tl_detector,
+                                async_input_frame,
+                                tl_conf,
+                                args.imgsz,
+                                args.inference_scale,
+                            )
+                            tl_last_submit_time = now_ts
 
             # ----------------------------------------------------------
             # Lane segmentation model (if provided)
@@ -787,29 +1187,73 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                     lane_instances, lane_infer_duration = run_lane_segmentation_once(
                         lane_model, frame, lane_conf, lane_imgsz, lane_scale
                     )
+                    lane_update_count += 1
+                    lane_updated = True
                 else:
+                    if lane_pending is not None and not lane_pending.done():
+                        lane_stale_frames += 1
+
                     if lane_pending is not None and lane_pending.done():
                         try:
                             lane_instances, lane_infer_duration = lane_pending.result()
+                            lane_update_count += 1
+                            lane_updated = True
                         except Exception as exc:
                             print(f"[ERROR] Lane model inference failed: {exc}")
                             lane_instances = []
+                            lane_updated = True
                         lane_pending = None
 
                     if lane_pending is None:
                         lane_pending = lane_worker.submit(
                             run_lane_segmentation_once,
-                            lane_model, frame.copy(), lane_conf, lane_imgsz, lane_scale,
+                            lane_model,
+                            async_input_frame,
+                            lane_conf,
+                            lane_imgsz,
+                            lane_scale,
                         )
 
-                lane_intersection_score, lane_intersection, lane_intersection_reasons = compute_intersection_status(
-                    lane_instances,
-                    frame.shape,
-                    threshold=args.intersection_threshold,
+                cache_needs_refresh = (
+                    lane_draw_cache is None
+                    or lane_updated
                 )
+                if cache_needs_refresh:
+                    # Cache rebuild is deferred until display size is known for this frame.
+                    lane_draw_cache_shape = None
+
+                if lane_updated:
+                    intersection_start = time.perf_counter()
+                    lane_intersection_score, lane_intersection, lane_intersection_reasons = compute_intersection_status(
+                        lane_instances,
+                        frame.shape,
+                        threshold=args.intersection_threshold,
+                    )
+                    intersection_duration = max(time.perf_counter() - intersection_start, 0.0)
+
+            draw_start = time.perf_counter()
+            disp_h, disp_w = disp_frame.shape[:2]
 
             if has_lane:
-                draw_lane_instances(frame, lane_instances, alpha=args.lane_mask_alpha, draw_contours=args.lane_draw_contours)
+                cache_needs_refresh = (
+                    lane_draw_cache is None
+                    or lane_updated
+                    or lane_draw_cache_shape != (disp_h, disp_w)
+                )
+                if cache_needs_refresh:
+                    lane_draw_cache = build_lane_draw_cache(
+                        lane_instances,
+                        disp_frame.shape,
+                        draw_contours=args.lane_draw_contours,
+                    )
+                    lane_draw_cache_shape = (disp_h, disp_w)
+
+                draw_lane_from_cache(
+                    disp_frame,
+                    lane_draw_cache,
+                    alpha=args.lane_mask_alpha,
+                    draw_contours=args.lane_draw_contours,
+                )
 
             # ----------------------------------------------------------
             # Draw sign detections (green)
@@ -817,14 +1261,21 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
             sign_to_draw = sign_stable
             if args.max_draw_detections > 0:
                 sign_to_draw = sign_to_draw[: args.max_draw_detections]
-
-            for (x1, y1, x2, y2, conf, cls) in sign_to_draw:
-                class_name = resolve_class_name(detector, cls)
-                _draw_detection(
-                    frame, x1, y1, x2, y2,
-                    f"{class_name}: {conf:.2f}",
-                    _SIGN_BOX_COLOR, _SIGN_TEXT_COLOR,
+            sign_cache_needs_refresh = (
+                sign_overlay_cache is None
+                or sign_updated
+                or sign_overlay_shape != (disp_h, disp_w)
+            )
+            if sign_cache_needs_refresh:
+                sign_overlay_cache = build_sign_overlay_cache(
+                    disp_frame.shape,
+                    frame.shape,
+                    sign_to_draw,
+                    detector,
                 )
+                sign_overlay_shape = (disp_h, disp_w)
+
+            apply_overlay_cache(disp_frame, sign_overlay_cache)
 
             # ----------------------------------------------------------
             # Draw traffic light detections (colour-coded)
@@ -833,15 +1284,21 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 tl_to_draw = tl_stable
                 if args.max_draw_detections > 0:
                     tl_to_draw = tl_to_draw[: args.max_draw_detections]
-
-                for (x1, y1, x2, y2, conf, cls) in tl_to_draw:
-                    class_name = resolve_class_name(tl_detector, cls)
-                    color = _tl_color(class_name)
-                    _draw_detection(
-                        frame, x1, y1, x2, y2,
-                        f"TL-{class_name}: {conf:.2f}",
-                        color, color,
+                tl_cache_needs_refresh = (
+                    tl_overlay_cache is None
+                    or tl_updated
+                    or tl_overlay_shape != (disp_h, disp_w)
+                )
+                if tl_cache_needs_refresh:
+                    tl_overlay_cache = build_tl_overlay_cache(
+                        disp_frame.shape,
+                        frame.shape,
+                        tl_to_draw,
+                        tl_detector,
                     )
+                    tl_overlay_shape = (disp_h, disp_w)
+
+                apply_overlay_cache(disp_frame, tl_overlay_cache)
 
             # ----------------------------------------------------------
             # HUD
@@ -861,23 +1318,75 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 lane_fps_ema = lane_fps if lane_fps_ema == 0.0 else 0.9 * lane_fps_ema + 0.1 * lane_fps
 
             mode_tag = "SYNC" if args.sync_inference else "ASYNC"
-            cv2.putText(frame, f"Display FPS: {display_fps_ema:.1f} | Sign FPS: {sign_fps_ema:.1f}" + (f" | TL FPS: {tl_fps_ema:.1f}" if has_tl else "") + (f" | Lane FPS: {lane_fps_ema:.1f}" if has_lane else ""), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
-            cv2.putText(frame, f"Mode: {mode_tag} | Scale: {args.inference_scale:.2f}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(frame, f"Signs raw/stable: {sign_raw_count}/{len(sign_to_draw)}" + (f"  |  TL raw/stable: {tl_raw_count}/{len(tl_to_draw) if has_tl else 0}" if has_tl else ""), (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+            cv2.putText(disp_frame, f"Display FPS: {display_fps_ema:.1f} | Sign FPS: {sign_fps_ema:.1f}" + (f" | TL FPS: {tl_fps_ema:.1f}" if has_tl else "") + (f" | Lane FPS: {lane_fps_ema:.1f}" if has_lane else ""), (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 0, 255), 2)
+            cv2.putText(disp_frame, f"Mode: {mode_tag} | Scale: {args.inference_scale:.2f}", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(disp_frame, f"Signs raw/stable: {sign_raw_count}/{len(sign_to_draw)}" + (f"  |  TL raw/stable: {tl_raw_count}/{len(tl_to_draw) if has_tl else 0}" if has_tl else ""), (20, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
             if has_lane:
                 status_text = f"Intersection: {'YES' if lane_intersection else 'no'} ({lane_intersection_score:.2f})"
                 if lane_intersection_reasons:
                     status_text += " | " + ",".join(lane_intersection_reasons)
-                cv2.putText(frame, status_text, (20, 141), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 220) if lane_intersection else (80, 180, 80), 2)
+                cv2.putText(disp_frame, status_text, (20, 141), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 220) if lane_intersection else (80, 180, 80), 2)
 
-            _draw_legend(frame, has_tl, has_lane)
+            _draw_legend(disp_frame, has_tl, has_lane)
+            draw_duration = max(time.perf_counter() - draw_start, 0.0)
 
-            disp_frame = resize_to_fit(frame, args.window_width, args.window_height)
+            display_start = time.perf_counter()
             cv2.imshow(window_name, disp_frame)
+            key = cv2.waitKey(1)
+            display_duration = max(time.perf_counter() - display_start, 0.0)
 
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            loop_duration = max(time.perf_counter() - loop_start, 1e-6)
+
+            if args.profile_stages:
+                frame_count += 1
+                profile_totals["capture"] += capture_duration
+                profile_totals["sign_infer"] += max(sign_infer_duration, 0.0)
+                profile_totals["tl_infer"] += max(tl_infer_duration, 0.0)
+                profile_totals["lane_infer"] += max(lane_infer_duration, 0.0)
+                profile_totals["sign_consensus"] += sign_consensus_duration
+                profile_totals["tl_consensus"] += tl_consensus_duration
+                profile_totals["intersection"] += intersection_duration
+                profile_totals["draw"] += draw_duration
+                profile_totals["display"] += display_duration
+                profile_totals["loop"] += loop_duration
+
+                if frame_count % max(1, args.profile_every) == 0:
+                    divisor = float(frame_count)
+                    avg_loop_ms = (profile_totals["loop"] / divisor) * 1000.0
+                    avg_fps = (1.0 / (profile_totals["loop"] / divisor)) if profile_totals["loop"] > 0.0 else 0.0
+                    elapsed_s = max(profile_totals["loop"], 1e-6)
+                    sign_stale_pct = (100.0 * sign_stale_frames / divisor) if sign_worker is not None else 0.0
+                    tl_stale_pct = (100.0 * tl_stale_frames / divisor) if tl_worker is not None else 0.0
+                    lane_stale_pct = (100.0 * lane_stale_frames / divisor) if lane_worker is not None else 0.0
+                    capture_reuse_pct = (100.0 * capture_reuse_frames / divisor) if args.async_capture else 0.0
+                    sign_updates_hz = (float(sign_update_count) / elapsed_s) if sign_worker is not None else 0.0
+                    tl_updates_hz = (float(tl_update_count) / elapsed_s) if tl_worker is not None else 0.0
+                    lane_updates_hz = (float(lane_update_count) / elapsed_s) if lane_worker is not None else 0.0
+
+                    print(
+                        "[PROFILE] "
+                        + f"avg_fps={avg_fps:.2f} avg_loop_ms={avg_loop_ms:.2f} | "
+                        + f"capture={(profile_totals['capture'] / divisor) * 1000.0:.2f}ms "
+                        + f"sign={(profile_totals['sign_infer'] / divisor) * 1000.0:.2f}ms "
+                        + (f"tl={(profile_totals['tl_infer'] / divisor) * 1000.0:.2f}ms " if has_tl else "")
+                        + (f"lane={(profile_totals['lane_infer'] / divisor) * 1000.0:.2f}ms " if has_lane else "")
+                        + f"cons_sign={(profile_totals['sign_consensus'] / divisor) * 1000.0:.2f}ms "
+                        + (f"cons_tl={(profile_totals['tl_consensus'] / divisor) * 1000.0:.2f}ms " if has_tl else "")
+                        + (f"intersection={(profile_totals['intersection'] / divisor) * 1000.0:.2f}ms " if has_lane else "")
+                        + f"draw={(profile_totals['draw'] / divisor) * 1000.0:.2f}ms "
+                        + f"display={(profile_totals['display'] / divisor) * 1000.0:.2f}ms"
+                        + (f" | stale(sign/tl/lane)={sign_stale_pct:.1f}/{tl_stale_pct:.1f}/{lane_stale_pct:.1f}%" if not args.sync_inference else "")
+                        + (f" | capture_reuse={capture_reuse_pct:.1f}%" if args.async_capture else "")
+                        + (f" | updates_hz(sign/tl/lane)={sign_updates_hz:.1f}/{tl_updates_hz:.1f}/{lane_updates_hz:.1f}" if not args.sync_inference else "")
+                    )
+
+            if key & 0xFF == ord("q"):
                 break
     finally:
+        if capture_stop_event is not None:
+            capture_stop_event.set()
+        if capture_thread is not None:
+            capture_thread.join(timeout=1.0)
         if sign_worker is not None:
             sign_worker.shutdown(wait=False, cancel_futures=True)
         if tl_worker is not None:
@@ -995,6 +1504,10 @@ def main():
     elif args.intersection_threshold > 1.0:
         print(f"[WARNING] --intersection-threshold={args.intersection_threshold} is above 1.0. Clamping to 1.0.")
         args.intersection_threshold = 1.0
+
+    if args.profile_every < 1:
+        print(f"[WARNING] Invalid --profile-every={args.profile_every}. Falling back to 1.")
+        args.profile_every = 1
 
     try:
         print(f"Initializing {args.model.upper()}...")

@@ -76,13 +76,12 @@ class YOLODetector(BaseTrafficSignDetector):
         if boxes is None or len(boxes) == 0:
             return []
 
-        xyxy = boxes.xyxy.cpu().numpy()
-        confs = boxes.conf.cpu().numpy()
-        classes = boxes.cls.cpu().numpy()
+        # boxes.data shape: [N, 6] => x1, y1, x2, y2, conf, cls
+        det_data = boxes.data.cpu().numpy()
 
         detections = []
-        for i in range(len(xyxy)):
-            x1, y1, x2, y2 = xyxy[i]
-            detections.append((int(x1), int(y1), int(x2), int(y2), float(confs[i]), int(classes[i])))
+        for i in range(len(det_data)):
+            x1, y1, x2, y2, conf, cls = det_data[i]
+            detections.append((int(x1), int(y1), int(x2), int(y2), float(conf), int(cls)))
 
         return detections

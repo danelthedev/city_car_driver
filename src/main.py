@@ -11,6 +11,7 @@ import mss
 import numpy as np
 from ultralytics import YOLO
 
+from perception.telemetry import SpeedTelemetryReader
 from perception.traffic_signs.factory import ModelFactory
 
 
@@ -230,6 +231,11 @@ def parse_args():
         type=int,
         default=120,
         help="How many frames to aggregate before printing profiling statistics.",
+    )
+    parser.add_argument(
+        "--speed-telemetry",
+        action="store_true",
+        help="Enable speed extraction from process memory via the perception telemetry module.",
     )
 
     return parser.parse_args()
@@ -922,6 +928,31 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
     lane_intersection = False
     lane_intersection_reasons = []
 
+    speed_telemetry_reader = None
+    speed_kmh = None
+    speed_last_update_ts = 0.0
+    speed_process_name = "starter.exe"
+    speed_module_name = "pdd.dll"
+    speed_offset = 0xE322B0
+    speed_poll_interval_ms = 50.0
+    speed_stale_timeout_s = 0.50
+    if args.speed_telemetry:
+        try:
+            speed_telemetry_reader = SpeedTelemetryReader(
+                process_name=speed_process_name,
+                module_name=speed_module_name,
+                speed_offset=speed_offset,
+                poll_interval_ms=speed_poll_interval_ms,
+            )
+            print(
+                "[INFO] Speed telemetry enabled: "
+                + f"process={speed_process_name}, module={speed_module_name}, "
+                + f"offset=0x{int(speed_offset):X}, poll={float(speed_poll_interval_ms):.1f}ms"
+            )
+        except Exception as exc:
+            print(f"[WARNING] Failed to initialize speed telemetry: {exc}")
+            speed_telemetry_reader = None
+
     display_fps_ema = 0.0
     sign_fps_ema = 0.0
     tl_fps_ema = 0.0
@@ -1234,6 +1265,15 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
             draw_start = time.perf_counter()
             disp_h, disp_w = disp_frame.shape[:2]
 
+            if speed_telemetry_reader is not None:
+                now_ts = time.perf_counter()
+                latest_speed = speed_telemetry_reader.read_speed_if_due(now_ts)
+                if latest_speed is not None:
+                    speed_kmh = float(latest_speed)
+                    speed_last_update_ts = now_ts
+                elif speed_kmh is not None and (now_ts - speed_last_update_ts) > speed_stale_timeout_s:
+                    speed_kmh = None
+
             if has_lane:
                 cache_needs_refresh = (
                     lane_draw_cache is None
@@ -1326,6 +1366,9 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 if lane_intersection_reasons:
                     status_text += " | " + ",".join(lane_intersection_reasons)
                 cv2.putText(disp_frame, status_text, (20, 141), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 220) if lane_intersection else (80, 180, 80), 2)
+            if speed_telemetry_reader is not None:
+                speed_text = f"Speed(mem): {speed_kmh:.1f} km/h" if speed_kmh is not None else "Speed(mem): --"
+                cv2.putText(disp_frame, speed_text, (20, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
             _draw_legend(disp_frame, has_tl, has_lane)
             draw_duration = max(time.perf_counter() - draw_start, 0.0)
@@ -1393,6 +1436,8 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
             tl_worker.shutdown(wait=False, cancel_futures=True)
         if lane_worker is not None:
             lane_worker.shutdown(wait=False, cancel_futures=True)
+        if speed_telemetry_reader is not None:
+            speed_telemetry_reader.close()
         cv2.destroyAllWindows()
 
 

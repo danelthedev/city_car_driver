@@ -7,3 +7,4 @@ numpy>=1.24.0
 matplotlib>=3.7.0
 pyyaml>=6.0
 pymem>=1.14.0
+interception-python>=1.13.6

@@ -2,6 +2,7 @@
 venv/
 data/*
 !data/*.py
+!data/pipeline/
 *.pt
 !models/*.pt
 runs/

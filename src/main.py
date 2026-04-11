@@ -11,7 +11,7 @@ import mss
 import numpy as np
 from ultralytics import YOLO
 
-from perception.telemetry import SpeedTelemetryReader
+from perception.telemetry import SpeedTelemetryReader, PixelColorSampler
 from perception.traffic_signs.factory import ModelFactory
 
 
@@ -937,10 +937,12 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
 
     speed_telemetry_reader = None
     speed_kmh = None
+    dist_turn_m = None
     speed_last_update_ts = 0.0
     speed_process_name = "starter.exe"
     speed_module_name = "pdd.dll"
     speed_offset = 0xE322B0
+    dist_turn_offset = 0xF10C70
     speed_poll_interval_ms = 50.0
     speed_stale_timeout_s = 0.50
     if args.speed_telemetry:
@@ -949,6 +951,7 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 process_name=speed_process_name,
                 module_name=speed_module_name,
                 speed_offset=speed_offset,
+                dist_turn_offset=dist_turn_offset,
                 poll_interval_ms=speed_poll_interval_ms,
             )
             print(
@@ -959,6 +962,13 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
         except Exception as exc:
             print(f"[WARNING] Failed to initialize speed telemetry: {exc}")
             speed_telemetry_reader = None
+
+    pixel_sampler = PixelColorSampler(
+        pixels=((2283, 93), (2321, 92)),
+        target_hex="#D2B819",
+        threshold=25.0,
+        poll_interval_ms=50.0,
+    )
 
     display_fps_ema = 0.0
     sign_fps_ema = 0.0
@@ -1274,12 +1284,16 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
 
             if speed_telemetry_reader is not None:
                 now_ts = time.perf_counter()
-                latest_speed = speed_telemetry_reader.read_speed_if_due(now_ts)
-                if latest_speed is not None:
-                    speed_kmh = float(latest_speed)
+                latest_speed, latest_dist_turn = speed_telemetry_reader.read_telemetry_if_due(now_ts)
+                if latest_speed is not None or latest_dist_turn is not None:
+                    if latest_speed is not None:
+                        speed_kmh = float(latest_speed)
+                    if latest_dist_turn is not None:
+                        dist_turn_m = float(latest_dist_turn)
                     speed_last_update_ts = now_ts
                 elif speed_kmh is not None and (now_ts - speed_last_update_ts) > speed_stale_timeout_s:
                     speed_kmh = None
+                    dist_turn_m = None
 
             if has_lane:
                 cache_needs_refresh = (
@@ -1375,7 +1389,25 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 cv2.putText(disp_frame, status_text, (20, 141), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (20, 20, 220) if lane_intersection else (80, 180, 80), 2)
             if speed_telemetry_reader is not None:
                 speed_text = f"Speed(mem): {speed_kmh:.1f} km/h" if speed_kmh is not None else "Speed(mem): --"
-                cv2.putText(disp_frame, speed_text, (20, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                dist_text = f"Dist turn: {dist_turn_m:.0f} m" if dist_turn_m is not None else "Dist turn: --"
+                cv2.putText(disp_frame, speed_text + "  |  " + dist_text, (20, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+            pixel_sampler.sample_if_due(time.perf_counter())
+            if pixel_sampler.last_results:
+                left_match  = pixel_sampler.last_results[0][2]
+                right_match = pixel_sampler.last_results[1][2]
+                left_hex  = "#{:02X}{:02X}{:02X}".format(*pixel_sampler.last_results[0][4])
+                right_hex = "#{:02X}{:02X}{:02X}".format(*pixel_sampler.last_results[1][4])
+                if left_match and right_match:
+                    nav_label = "turn around"
+                elif right_match:
+                    nav_label = "turn left"
+                elif left_match:
+                    nav_label = "turn right"
+                else:
+                    nav_label = "move forward"
+                px_color = (0, 220, 80) if (left_match or right_match) else (160, 160, 160)
+                cv2.putText(disp_frame, f"Nav: {nav_label}  [{left_hex} | {right_hex}]", (20, 207), cv2.FONT_HERSHEY_SIMPLEX, 0.60, px_color, 2)
 
             _draw_legend(disp_frame, has_tl, has_lane)
             draw_duration = max(time.perf_counter() - draw_start, 0.0)

@@ -7,8 +7,6 @@ import math
 import time
 
 
-# Target color in BGR (OpenCV / mss convention)
-_TARGET_BGR = (0x19, 0xB8, 0xD2)   # #D2B819 → R=0xD2, G=0xB8, B=0x19
 _DEFAULT_PIXELS = ((2286, 80), (2324, 80))
 
 
@@ -81,11 +79,6 @@ class PixelColorSampler:
             return results
         except Exception:
             return None
-
-    @property
-    def any_match(self) -> bool:
-        """True if the most recent sample found a match on any pixel."""
-        return any(matched for _, _, matched, *_ in self.last_results)
 
     def close(self):
         if self._sct is not None:

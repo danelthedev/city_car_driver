@@ -245,6 +245,13 @@ def parse_args():
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
+# Normalized screen coordinates — copy from your ReShade preset.
+MINIMAP_DEST_X: float = 0.020
+MINIMAP_DEST_Y: float = 0.760
+MINIMAP_DEST_W: float = 0.230
+MINIMAP_DEST_H: float = 0.230
+
+
 # Per-model colour schemes so signs and traffic lights are visually distinct.
 # Signs: green boxes.  Traffic lights: colour-coded by class name.
 _SIGN_BOX_COLOR = (0, 255, 0)

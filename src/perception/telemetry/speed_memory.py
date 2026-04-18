@@ -1,6 +1,75 @@
 import time
 
 
+class DistTurnKalmanFilter:
+    """1-D Kalman filter for distance-to-turn.
+
+    Prediction uses the current vehicle speed as a control input so the
+    estimate keeps decreasing even between sporadic memory reads.
+
+    State  : estimated distance to turn (metres)
+    Control: speed (m/s) × Δt  →  expected distance decrease per step
+    """
+
+    def __init__(
+        self,
+        process_noise: float = 2.0,
+        measurement_noise: float = 15.0,
+    ):
+        self.Q = float(process_noise)       # process noise variance (m²)
+        self.R = float(measurement_noise)   # measurement noise variance (m²)
+
+        self._x: float | None = None        # state estimate
+        self._P: float = 1.0                # estimate covariance
+        self._last_ts: float | None = None  # timestamp of last update
+
+    @property
+    def estimate(self) -> float | None:
+        return self._x
+
+    def reset(self) -> None:
+        self._x = None
+        self._P = 1.0
+        self._last_ts = None
+
+    def predict(self, speed_ms: float, now_ts: float) -> None:
+        """Advance the state using current speed (no measurement)."""
+        if self._x is None or self._last_ts is None:
+            self._last_ts = now_ts
+            return
+        dt = max(0.0, now_ts - self._last_ts)
+        self._last_ts = now_ts
+        if dt <= 0.0:
+            return
+        # State transition: distance decreases by speed * dt
+        self._x = max(0.0, self._x - speed_ms * dt)
+        # Covariance grows with time
+        self._P += self.Q * dt
+
+    def update(self, measurement: float, speed_ms: float, now_ts: float) -> float:
+        """Incorporate a new raw measurement and return the updated estimate."""
+        if self._x is None or self._last_ts is None:
+            # First measurement: initialise directly
+            self._x = measurement
+            self._P = self.R
+            self._last_ts = now_ts
+            return self._x
+
+        # Predict forward to current time
+        dt = max(0.0, now_ts - self._last_ts)
+        self._last_ts = now_ts
+        x_pred = max(0.0, self._x - speed_ms * dt)
+        P_pred = self._P + self.Q * dt
+
+        # Kalman gain
+        K = P_pred / (P_pred + self.R)
+
+        # Update
+        self._x = x_pred + K * (measurement - x_pred)
+        self._P = (1.0 - K) * P_pred
+        return self._x
+
+
 class SpeedTelemetryReader:
     def __init__(
         self,

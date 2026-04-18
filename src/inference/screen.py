@@ -6,7 +6,7 @@ import cv2
 import mss
 import numpy as np
 
-from perception.telemetry import SpeedTelemetryReader, PixelColorSampler
+from perception.telemetry import SpeedTelemetryReader, DistTurnKalmanFilter, PixelColorSampler
 from .detection import (
     run_detection_once,
     run_lane_segmentation_once,
@@ -116,6 +116,11 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
     speed_kmh = None
     dist_turn_m = None
     dist_dest_m = None
+    dist_turn_kalman = DistTurnKalmanFilter(process_noise=2.0, measurement_noise=15.0)
+    dist_turn_last_raw: float | None = None
+    dist_turn_frozen_since: float | None = None
+    dist_turn_frozen_threshold_m: float = 1.0   # metres — smaller change = considered frozen
+    dist_turn_frozen_timeout_s: float = 0.35    # seconds before we stop trusting a stuck value
     speed_last_update_ts = 0.0
     speed_stale_timeout_s = 0.50
     if args.speed_telemetry:
@@ -336,11 +341,25 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
             if speed_telemetry_reader is not None:
                 now_ts = time.perf_counter()
                 latest_speed, latest_dist_turn, latest_dist_dest = speed_telemetry_reader.read_telemetry_if_due(now_ts)
+                _speed_ms = (speed_kmh / 3.6) if speed_kmh is not None else 0.0
                 if latest_speed is not None or latest_dist_turn is not None or latest_dist_dest is not None:
                     if latest_speed is not None:
                         speed_kmh = float(latest_speed)
+                        _speed_ms = speed_kmh / 3.6
                     if latest_dist_turn is not None:
                         dist_turn_m = float(latest_dist_turn)
+                        # Detect frozen measurement (game stops updating near intersection)
+                        if dist_turn_last_raw is None or abs(dist_turn_m - dist_turn_last_raw) >= dist_turn_frozen_threshold_m:
+                            dist_turn_last_raw = dist_turn_m
+                            dist_turn_frozen_since = now_ts
+                        frozen_dur = now_ts - dist_turn_frozen_since if dist_turn_frozen_since is not None else 0.0
+                        if frozen_dur < dist_turn_frozen_timeout_s:
+                            dist_turn_kalman.update(dist_turn_m, _speed_ms, now_ts)
+                        else:
+                            # Measurement is stuck — trust only the speed-based prediction
+                            dist_turn_kalman.predict(_speed_ms, now_ts)
+                    else:
+                        dist_turn_kalman.predict(_speed_ms, now_ts)
                     if latest_dist_dest is not None:
                         dist_dest_m = float(latest_dist_dest)
                     speed_last_update_ts = now_ts
@@ -348,6 +367,11 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                     speed_kmh = None
                     dist_turn_m = None
                     dist_dest_m = None
+                    dist_turn_last_raw = None
+                    dist_turn_frozen_since = None
+                    dist_turn_kalman.reset()
+                else:
+                    dist_turn_kalman.predict(_speed_ms, now_ts)
 
             # --- Draw lane overlay ---
             if has_lane:
@@ -415,9 +439,11 @@ def run_inference_screen_capture(args, detector, tl_detector=None, lane_model=No
                 )
             if speed_telemetry_reader is not None:
                 speed_text = f"Speed(mem): {speed_kmh:.1f} km/h" if speed_kmh is not None else "Speed(mem): --"
+                _kf_est = dist_turn_kalman.estimate
                 dist_text = f"Dist turn: {dist_turn_m:.0f} m" if dist_turn_m is not None else "Dist turn: --"
+                kf_text = f"(KF: {_kf_est:.0f} m)" if _kf_est is not None else "(KF: --)"
                 dest_text = f"Dist dest: {dist_dest_m:.0f} m" if dist_dest_m is not None else "Dist dest: --"
-                cv2.putText(disp_frame, speed_text + "  |  " + dist_text + "  |  " + dest_text, (20, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                cv2.putText(disp_frame, speed_text + "  |  " + dist_text + " " + kf_text + "  |  " + dest_text, (20, 174), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
 
             pixel_sampler.sample_if_due(time.perf_counter())
             if pixel_sampler.last_results:
